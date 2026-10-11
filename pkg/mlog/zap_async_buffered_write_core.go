@@ -17,6 +17,7 @@
 package mlog
 
 import (
+	"errors"
 	"fmt"
 	"time"
 	"unsafe"
@@ -30,6 +31,9 @@ import (
 
 // asyncTextIOCore is a wrapper around the textIOCore that writes the logs to the underlying buffered write syncer.
 var _ zapcore.Core = (*asyncTextIOCore)(nil)
+
+// errSyncTimeout is returned by Sync when the queued entries could not be written within the stop timeout.
+var errSyncTimeout = errors.New("sync async log timeout")
 
 // NewAsyncTextIOCore creates a new async text IO core.
 func NewAsyncTextIOCore(cfg *Config, ws zapcore.WriteSyncer, enab zapcore.LevelEnabler) *asyncTextIOCore {
@@ -77,6 +81,10 @@ type entryItem struct {
 	buf   *buffer.Buffer
 	level zapcore.Level
 	isCGO bool
+
+	// syncDone, when not nil, marks a sync barrier instead of a log entry: it is closed once
+	// every entry queued before it has been written and synced.
+	syncDone chan struct{}
 }
 
 // With returns a copy of the Core with the given fields added.
@@ -127,6 +135,11 @@ func (s *asyncTextIOCore) Write(ent zapcore.Entry, fields []zapcore.Field) error
 		isCGO: false,
 	}
 	s.write(entry)
+	if ent.Level > zapcore.ErrorLevel {
+		// Same as zap's ioCore: the process may be about to exit (Fatal), so the entry
+		// must reach the underlying writer before Write returns.
+		_ = s.Sync()
+	}
 	return nil
 }
 
@@ -199,9 +212,27 @@ type CEntry struct {
 	MessageLen  int
 }
 
-// Sync syncs the underlying buffered write syncer.
+// Sync waits until every entry queued before the call has been written and synced to the
+// underlying writer. It waits at most the configured stop timeout.
 func (s *asyncTextIOCore) Sync() error {
-	return nil
+	done := make(chan struct{})
+	timer := time.NewTimer(s.stopTimeout)
+	defer timer.Stop()
+
+	select {
+	case s.pending <- entryItem{syncDone: done}:
+	case <-s.notifier.Context().Done():
+		// stopped: Stop flushes the queue.
+		return nil
+	case <-timer.C:
+		return errSyncTimeout
+	}
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return errSyncTimeout
+	}
 }
 
 // background is the background goroutine to write the logs to the underlying buffered write syncer.
@@ -223,6 +254,13 @@ func (s *asyncTextIOCore) background() {
 
 // consumeEntry write the entry to the underlying buffered write syncer and free the buffer.
 func (s *asyncTextIOCore) consumeEntry(ent entryItem) {
+	if ent.syncDone != nil {
+		if err := s.bws.Sync(); err != nil {
+			metrics.LoggingIOFailureTotal.Inc()
+		}
+		close(ent.syncDone)
+		return
+	}
 	length := ent.buf.Len()
 	metrics.LoggingPendingWriteTotal.Dec()
 

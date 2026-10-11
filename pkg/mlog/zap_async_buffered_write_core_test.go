@@ -17,9 +17,11 @@
 package mlog
 
 import (
+	"bytes"
 	"io"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -234,4 +236,99 @@ func (s *blockingWriteSyncer) waitUntilBlocked(t *testing.T) {
 
 func (s *blockingWriteSyncer) unblock() {
 	s.releaseOnce.Do(func() { close(s.release) })
+}
+
+// slowRecordWriter records everything written to it, slowly, so that entries pile up in the async queue.
+type slowRecordWriter struct {
+	delay time.Duration
+	block chan struct{} // when not nil, Write blocks until it is closed.
+
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (w *slowRecordWriter) Write(p []byte) (int, error) {
+	if w.block != nil {
+		<-w.block
+	}
+	time.Sleep(w.delay)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *slowRecordWriter) Sync() error { return nil }
+
+// noExitHook replaces the os.Exit(1) that zap runs after a Fatal entry.
+type noExitHook struct{}
+
+func (noExitHook) OnWrite(*zapcore.CheckedEntry, []zapcore.Field) {}
+
+func (w *slowRecordWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+func newTestAsyncCore(ws zapcore.WriteSyncer, stopTimeout time.Duration) *asyncTextIOCore {
+	return NewAsyncTextIOCore(
+		&Config{
+			AsyncWriteEnable:            true,
+			AsyncWriteFlushInterval:     time.Hour,
+			AsyncWriteDroppedTimeout:    100 * time.Millisecond,
+			AsyncWriteNonDroppableLevel: "error",
+			AsyncWriteStopTimeout:       stopTimeout,
+			AsyncWritePendingLength:     1024,
+			AsyncWriteBufferSize:        1, // every entry goes straight to the slow writer.
+			AsyncWriteMaxBytesPerLog:    1024,
+		},
+		ws,
+		zap.DebugLevel,
+	)
+}
+
+// A Fatal entry must be on the underlying writer when the call returns: the process exits right after.
+func TestAsyncTextIOCoreFatalIsWrittenBeforeReturn(t *testing.T) {
+	w := &slowRecordWriter{delay: 10 * time.Millisecond}
+	core := newTestAsyncCore(w, 10*time.Second)
+	defer core.Stop()
+	// Log the Fatal entry like production does, but do not exit the test process.
+	logger := zap.New(core, zap.WithFatalHook(noExitHook{}))
+
+	for i := 0; i < 50; i++ {
+		logger.Info("backlog entry")
+	}
+	logger.Fatal("fatal entry")
+
+	out := w.String()
+	assert.Equal(t, 50, strings.Count(out, "backlog entry"), "entries queued before the Fatal must be written first")
+	assert.Contains(t, out, "fatal entry")
+}
+
+func TestAsyncTextIOCoreSyncWaitsForQueuedEntries(t *testing.T) {
+	w := &slowRecordWriter{delay: 10 * time.Millisecond}
+	core := newTestAsyncCore(w, 10*time.Second)
+	defer core.Stop()
+	logger := zap.New(core)
+
+	for i := 0; i < 20; i++ {
+		logger.Info("queued entry")
+	}
+	require.NoError(t, core.Sync())
+	assert.Equal(t, 20, strings.Count(w.String(), "queued entry"))
+}
+
+func TestAsyncTextIOCoreSyncTimesOutOnBlockedWriter(t *testing.T) {
+	w := &slowRecordWriter{block: make(chan struct{})}
+	core := newTestAsyncCore(w, 200*time.Millisecond)
+	logger := zap.New(core)
+	logger.Info("stuck entry")
+
+	start := time.Now()
+	err := core.Sync()
+	assert.ErrorIs(t, err, errSyncTimeout)
+	assert.Less(t, time.Since(start), 5*time.Second)
+
+	close(w.block)
+	core.Stop()
 }
